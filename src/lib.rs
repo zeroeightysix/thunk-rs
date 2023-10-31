@@ -17,8 +17,6 @@
 //!   over `AtomicThunk`.
 
 #![cfg_attr(test, feature(test))]
-#![feature(unsized_locals)]
-#![feature(untagged_unions)]
 
 extern crate unreachable;
 

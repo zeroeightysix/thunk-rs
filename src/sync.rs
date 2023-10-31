@@ -1,12 +1,12 @@
 use std::borrow::{Borrow, BorrowMut};
 use std::cell::UnsafeCell;
 use std::mem;
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-use unreachable::{unreachable, UncheckedOptionExt};
+use unreachable::unreachable;
 
 use crate::{LazyRef, LazyMut, Lazy};
 
@@ -60,10 +60,9 @@ const THUNK_INVALIDATED: usize = 4;
 /// deferred - in which case it contains a boxed closure which holds necessary
 /// data to run the deferred computation; or, it holds the already computed
 /// result.
-#[allow(unions_with_drop_fields)]
 union Cache<T> {
-    deferred: Box<dyn FnOnce() -> ()>,
-    evaluated: T,
+    deferred: ManuallyDrop<Box<dyn FnOnce() -> ()>>,
+    evaluated: ManuallyDrop<T>,
 
     #[allow(dead_code)]
     evaluating: (),
@@ -73,8 +72,8 @@ union Cache<T> {
 impl<T> Drop for AtomicThunk<T> {
     fn drop(&mut self) {
         match unsafe { ptr::read(&self.flag) }.into_inner() {
-            THUNK_DEFERRED => mem::drop(unsafe { self.take_data().deferred }),
-            THUNK_EVALUATED => mem::drop(unsafe { self.take_data().evaluated }),
+            THUNK_DEFERRED => drop(ManuallyDrop::into_inner(unsafe { self.take_data().deferred })),
+            THUNK_EVALUATED => drop(ManuallyDrop::into_inner(unsafe { self.take_data().evaluated })),
             THUNK_INVALIDATED => {}
             THUNK_LOCKING | THUNK_LOCKED => {
                 unreachable!("thunks should never be dropped while locking or locked!")
@@ -94,9 +93,9 @@ impl<T> Cache<T> {
     unsafe fn evaluate_thunk(&mut self) {
         let Cache { deferred: thunk } = mem::replace(self, Cache { evaluating: () });
 
-        let thunk_cast = Box::from_raw(Box::into_raw(thunk) as *mut dyn FnOnce() -> T);
+        let thunk_cast = Box::from_raw(Box::into_raw(ManuallyDrop::into_inner(thunk)) as *mut dyn FnOnce() -> T);
 
-        mem::replace(self, Cache { evaluated: thunk_cast() });
+        let _ = mem::replace(self, Cache { evaluated: ManuallyDrop::new(thunk_cast()) });
     }
 }
 
@@ -140,7 +139,7 @@ impl<T> Deref for AtomicThunk<T> {
     fn deref(&self) -> &T {
         self.force();
 
-        unsafe { &self.data.get().as_ref().unchecked_unwrap().evaluated }
+        unsafe { &self.data.get().as_ref().unwrap_unchecked().evaluated }
     }
 }
 
@@ -150,7 +149,7 @@ impl<T> DerefMut for AtomicThunk<T> {
     fn deref_mut(&mut self) -> &mut T {
         self.force();
 
-        unsafe { &mut self.data.get().as_mut().unchecked_unwrap().evaluated }
+        unsafe { &mut self.data.get().as_mut().unwrap_unchecked().evaluated }
     }
 }
 
@@ -161,7 +160,7 @@ impl<T> From<T> for AtomicThunk<T> {
         AtomicThunk {
             lock: Mutex::new(()),
             flag: AtomicUsize::new(THUNK_EVALUATED),
-            data: UnsafeCell::new(Cache { evaluated: t }),
+            data: UnsafeCell::new(Cache { evaluated: ManuallyDrop::new(t) }),
         }
     }
 }
@@ -196,13 +195,13 @@ impl<T> AtomicThunk<T> {
                 // If the lock is available, lock it so that we can stop
                 // spinning in place.
                 THUNK_LOCKED => {
-                    let _ = self.lock.lock().unwrap();
+                    drop(self.lock.lock().unwrap());
                     return;
                 }
 
                 THUNK_DEFERRED |
                 THUNK_INVALIDATED |
-                _ => unreachable(),
+                _ => unreachable!(),
             }
         }
     }
@@ -222,7 +221,7 @@ impl<T> LazyRef for AtomicThunk<T> {
         AtomicThunk {
             lock: Mutex::new(()),
             flag: AtomicUsize::new(THUNK_DEFERRED),
-            data: UnsafeCell::new(Cache { deferred: thunk }),
+            data: UnsafeCell::new(Cache { deferred: ManuallyDrop::new(thunk) }),
         }
     }
 
@@ -230,7 +229,7 @@ impl<T> LazyRef for AtomicThunk<T> {
     #[inline]
     fn force(&self) {
         match self.flag
-                  .compare_and_swap(THUNK_DEFERRED, THUNK_LOCKING, Ordering::Acquire) {
+            .compare_exchange_weak(THUNK_DEFERRED, THUNK_LOCKING, Ordering::Acquire, Ordering::Acquire) {
             // If we've successfully taken control of the AtomicThunk:
             THUNK_DEFERRED => {
                 // Lock the mutex, and then set the flag to THUNK_LOCKED so that
@@ -278,7 +277,7 @@ impl<T> Lazy for AtomicThunk<T> {
     fn unwrap(mut self) -> T {
         self.force();
 
-        unsafe { self.take_data().evaluated }
+        unsafe { ManuallyDrop::into_inner(self.take_data().evaluated) }
     }
 }
 

@@ -1,6 +1,7 @@
 use std::borrow::{Borrow, BorrowMut};
 use std::cell::{Cell, UnsafeCell};
 use std::mem;
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
@@ -32,10 +33,9 @@ enum Flag {
 }
 
 
-#[allow(unions_with_drop_fields)]
 union Cache<T> {
-    deferred: Box<dyn FnOnce() -> ()>,
-    evaluated: T,
+    deferred: ManuallyDrop<Box<dyn FnOnce() -> ()>>,
+    evaluated: ManuallyDrop<T>,
 
     #[allow(dead_code)]
     evaluating: (),
@@ -45,8 +45,8 @@ union Cache<T> {
 impl<T> Drop for Thunk<T> {
     fn drop(&mut self) {
         match self.flag.get() {
-            Flag::Deferred => mem::drop(unsafe { self.take_data().deferred }),
-            Flag::Evaluated => mem::drop(unsafe { self.take_data().evaluated }),
+            Flag::Deferred => drop(ManuallyDrop::into_inner(unsafe { self.take_data().deferred })),
+            Flag::Evaluated => drop(ManuallyDrop::into_inner(unsafe { self.take_data().evaluated })),
             Flag::Empty => {}
         }
     }
@@ -62,9 +62,9 @@ impl<T> Cache<T> {
     unsafe fn evaluate_thunk(&mut self) {
         let Cache { deferred: thunk } = mem::replace(self, Cache { evaluating: () });
 
-        let thunk_cast = Box::from_raw(Box::into_raw(thunk) as *mut dyn FnOnce() -> T);
+        let thunk_cast = Box::from_raw(Box::into_raw(ManuallyDrop::into_inner(thunk)) as *mut dyn FnOnce() -> T);
 
-        mem::replace(self, Cache { evaluated: thunk_cast() });
+        let _ = mem::replace(self, Cache { evaluated: ManuallyDrop::new(thunk_cast()) });
     }
 }
 
@@ -128,7 +128,7 @@ impl<T> From<T> for Thunk<T> {
     fn from(t: T) -> Thunk<T> {
         Thunk {
             flag: Cell::new(Flag::Evaluated),
-            data: UnsafeCell::new(Cache { evaluated: t }),
+            data: UnsafeCell::new(Cache { evaluated: ManuallyDrop::new(t) }),
         }
     }
 }
@@ -146,7 +146,7 @@ impl<T> Thunk<T> {
 impl<T> LazyRef for Thunk<T> {
     #[inline]
     fn defer<'a, F: FnOnce() -> T + 'a>(f: F) -> Thunk<T>
-        where T: 'a
+    where T: 'a
     {
         let thunk = {
             unsafe {
@@ -157,7 +157,7 @@ impl<T> LazyRef for Thunk<T> {
 
         Thunk {
             flag: Cell::new(Flag::Deferred),
-            data: UnsafeCell::new(Cache { deferred: thunk }),
+            data: UnsafeCell::new(Cache { deferred: ManuallyDrop::new(thunk) }),
         }
     }
 
@@ -187,7 +187,7 @@ impl<T> Lazy for Thunk<T> {
     fn unwrap(mut self) -> T {
         self.force();
 
-        unsafe { self.take_data().evaluated }
+        unsafe { ManuallyDrop::into_inner(self.take_data().evaluated) }
     }
 }
 
@@ -223,13 +223,13 @@ impl<T> RcThunk<T> {
     /// value. The `&mut RcThunk` passed in will be updated to reference the
     /// newly cloned value.
     pub fn make_mut(this: &mut RcThunk<T>) -> &mut T
-        where T: Clone
+    where T: Clone
     {
         // No, moving it into a temp doesn't help. We just have to trust the CSE
         // pass here. This is a known borrowchecking issue.
         if Rc::get_mut(&mut this.0).is_some() {
             return &mut **Rc::get_mut(&mut this.0)
-                              .expect("We know it's `some` - this won't change.");
+                .expect("We know it's `some` - this won't change.");
         }
 
         let new_rc = Rc::new(Thunk::computed((*this.0).clone()));
@@ -309,24 +309,24 @@ mod test {
 
     fn ten_thousand_xors_lazy(n: usize) -> Thunk<usize> {
         Thunk::defer(move || {
-                         (0..test::black_box(10000)).fold(test::black_box(n), |old, new| old ^ new)
-                     })
+            (0..test::black_box(10000)).fold(test::black_box(n), |old, new| old ^ new)
+        })
     }
 
     #[bench]
     fn ten_thousand_xors_threadsafe_strict(b: &mut Bencher) {
         b.iter(|| {
-                   let mut things: Vec<_> = (0..1000).map(ten_thousand_xors_strict).collect();
-                   test::black_box(things.pop())
-               })
+            let mut things: Vec<_> = (0..1000).map(ten_thousand_xors_strict).collect();
+            test::black_box(things.pop())
+        })
     }
 
     #[bench]
     fn ten_thousand_xors_threadsafe_lazy(b: &mut Bencher) {
         b.iter(|| {
-                   let mut things: Vec<_> = (0..1000).map(ten_thousand_xors_lazy).collect();
-                   test::black_box(things.pop())
-               })
+            let mut things: Vec<_> = (0..1000).map(ten_thousand_xors_lazy).collect();
+            test::black_box(things.pop())
+        })
     }
 
 
